@@ -27,9 +27,9 @@
 #include "tm.hpp"
 #include "macros.h"
 
-constexpr size_t NUM_LOCKS = 4096;
-constexpr size_t SPINLOCK_TRIES = 1024;
-constexpr size_t GRAIN = 4;
+constexpr size_t NUM_LOCKS = 32768;
+constexpr size_t SPINLOCK_TRIES = 100;
+constexpr size_t GRAIN = 3;
 
 struct write_map_value_t {
     void *value;
@@ -135,7 +135,7 @@ shared_t tm_create(size_t size, size_t align) noexcept {
     auto *region = new (std::nothrow) region_t;
     void *start;
 
-    if (unlikely(region != nullptr)) {
+    if (unlikely(region == nullptr)) {
         return invalid_shared;
     }
 
