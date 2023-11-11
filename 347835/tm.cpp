@@ -23,7 +23,7 @@
 #include <list>
 #include <cstdlib>
 #include <cstring>
-#include <unordered_map>
+#include <map>
 
 // Internal headers
 #include <tm.hpp>
@@ -32,14 +32,31 @@
 
 constexpr size_t NUM_LOCKS = 4096;
 
-struct transaction_t {
-    std::unordered_map<void *, void *> write_set;
-    std::vector<void *> read_set;
+struct write_map_key_t {
+    void *location;
+    uint64_t version_clock;
 };
 
-/**
- * @brief List of dynamically allocated segments.
- */
+struct write_map_value_t {
+    void *value;
+    size_t size;
+};
+
+struct write_map_comp_t {
+    bool operator()(write_map_key_t lhs, write_map_key_t rhs) {
+        return lhs.version_clock < rhs.version_clock;
+    }
+};
+
+struct transaction_t {
+    using key_type = write_map_key_t;
+    using value_type = write_map_value_t;
+    using comp_type = write_map_comp_t;
+    std::map<key_type, value_type, comp_type> write_set; // Location -> Value map.
+    std::vector<void *> read_set;   // Locations read.
+    std::vector<uint64_t> locks;    // Locks acquired.
+};
+
 struct segment_node {
     struct segment_node* prev;
     struct segment_node* next;
@@ -53,6 +70,11 @@ struct region_t {
     size_t size;
     size_t align;
     segment_list allocs;
+
+    uint64_t get_version_clock() {
+        // TODO(kostas): FIXME.
+        return version_clock.load();
+    }
 };
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -153,9 +175,10 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* unused(source
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* unused(source), size_t unused(size), void* unused(target)) {
-    // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+bool tm_write(shared_t shared, tx_t tx, void const* unused(source), size_t unused(size), void* unused(target)) {
+    uint64_t version_clock = ((region_t *) shared)->get_version_clock();
+    
+    return true;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
