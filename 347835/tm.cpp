@@ -22,14 +22,20 @@
 #include <unordered_map>
 #include <list>
 #include <cassert>
+#include <iostream>
 
 // Internal headers
 #include "tm.hpp"
 #include "macros.h"
 
-constexpr size_t NUM_LOCKS = 32768;
-constexpr size_t SPINLOCK_TRIES = 100;
-constexpr size_t GRAIN = 3;
+constexpr size_t pow2(size_t pow)
+{
+    return (pow >= sizeof(unsigned int)*8) ? 0 :
+        pow == 0 ? 1 : 2 * pow2(pow - 1);
+}
+
+constexpr size_t NUM_LOCKS = pow2(10);
+constexpr size_t SPINLOCK_TRIES = pow2(10);
 
 struct write_map_value_t {
     void *value;
@@ -84,8 +90,13 @@ struct region_t {
         return version_clock.load();
     }
 
+    uint64_t increment_version_clock() {
+        version_clock.fetch_add(1);
+    }
+
     size_t get_lock_table_idx(const void *location) const {
-        return (((uintptr_t) location) >> GRAIN) % NUM_LOCKS;
+        std::hash<const void*> hash;
+        return hash(location) % NUM_LOCKS;
     }
 
     uint64_t get_version_number(const void *location) const {
@@ -106,6 +117,7 @@ struct region_t {
     bool acquire_lock(const void *location) {
         size_t idx = get_lock_table_idx(location);
         std::atomic<bool> *l = &lock_table[idx].lock;
+
         // Bounded spinlock.
         size_t tries = 0;
         while (tries < SPINLOCK_TRIES) {
@@ -113,6 +125,7 @@ struct region_t {
                 // Lock acquired.
                 return true;
             }
+            tries++;
         }
 
         // Lock not acquired.
@@ -124,6 +137,13 @@ struct region_t {
         std::atomic<bool> *l = &lock_table[idx].lock;
         l->exchange(false, std::memory_order_release);
     }
+
+    void release_locks(transaction_t *transaction) {
+        // Release all acquired locks and abort.
+        for (auto it = transaction->write_set.begin(); it != transaction->write_set.end(); it++) {
+            release_lock(*it);
+        }
+    }
 };
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -132,13 +152,15 @@ struct region_t {
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
 shared_t tm_create(size_t size, size_t align) noexcept {
+    // std::cerr << "CHECKPOINT" << __LINE__ << std::endl;
+
     auto *region = new (std::nothrow) region_t;
     void *start;
 
     if (unlikely(region == nullptr)) {
         return invalid_shared;
     }
-
+    
     // We allocate the shared memory buffer such that its words are correctly
     // aligned.
     if (posix_memalign(&start, align, size) != 0) {
@@ -148,6 +170,7 @@ shared_t tm_create(size_t size, size_t align) noexcept {
 
     region->version_clock = 0;
     std::memset(start, 0, size);
+    region->start = start;
     region->size = size;
     region->align = align;
     region->allocs = nullptr;
@@ -158,8 +181,18 @@ shared_t tm_create(size_t size, size_t align) noexcept {
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
 **/
-void tm_destroy(shared_t unused(shared)) noexcept {
-    // TODO: tm_destroy(shared_t)
+void tm_destroy(shared_t shared) noexcept {
+    // Note: To be compatible with any implementation, shared_t is defined as a
+    // void*. For this particular implementation, the "real" type of a shared_t
+    // is a struct region*.
+    region_t *region = (region_t *) shared;
+    while (region->allocs) { // Free allocated segments
+        segment_list tail = region->allocs->next;
+        free(region->allocs);
+        region->allocs = tail;
+    }
+    free(region->start);
+    delete region;
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -192,6 +225,7 @@ size_t tm_align(shared_t shared) noexcept {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
+    // std::cerr << "CHECKPOINT" << __LINE__ << std::endl;
     auto *transaction = new (std::nothrow) transaction_t;
 
     if (unlikely(transaction == nullptr)) {
@@ -201,6 +235,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
     transaction->is_ro = is_ro;
     transaction->rv = ((region_t *) shared)->get_version_clock();
 
+    // std::cerr << "CHECKPOINT" << __LINE__ << std::endl;
     return (tx_t) transaction;
 }
 
@@ -223,20 +258,25 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
 
     region_t *region = ((region_t *) shared);
     // Acquire locks for write_set.
-    for (auto addr : transaction->write_set) {
-        if (!region->acquire_lock(addr)) {
+    for (auto it = transaction->write_set.cbegin(); it != transaction->write_set.cend(); it++) {
+        if (!region->acquire_lock(*it)) {
+            // region->release_locks(it);
+            std::cerr << "Aborting transaction..." << __LINE__ << std::endl;
+            region->release_locks(transaction);
             return false;
         }
     }
 
     // All locks acquired, increment_and_fetch on global version clock.
-    auto wv = region->version_clock.fetch_add(1);
+    auto wv = region->increment_version_clock();
 
     // Validate read set.
     if (wv != transaction->rv + 1) {
         for (const auto& addr: transaction->read_set) {
             auto wl = region->get_version_number(addr);
             if (wl > transaction->rv) {
+                std::cerr << "Aborting transaction..." << __LINE__ << std::endl;
+                region->release_locks(transaction);
                 return false;
             }
         }
@@ -248,7 +288,9 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
         region->release_lock(kv.first);
         region->set_version_number(kv.first, wv);
     }
+    // region->release_locks(transaction);
 
+    std::cerr << "Committed transaction!" << __LINE__ << std::endl;
     return true;
 }
 
@@ -279,13 +321,16 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     region_t *region = (region_t *) shared;
     bool locked = region->is_locked(source);
     uint64_t version_number = region->get_version_number(source);
-    std::memcpy(target, source, size);
 
-    bool cont = !locked && transaction->rv <= version_number;
+    bool cont = !locked && version_number <= transaction->rv;
     if (cont) {
+        std::memcpy(target, source, size);
         transaction->read_set.push_back(source);
+        return cont;
     }
 
+    std::cerr << "Aborting transaction..." << __LINE__ << std::endl;
+    region->release_locks(transaction);
     return cont;
 }
 
@@ -321,6 +366,7 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void **target) noe
     // We allocate the dynamic segment such that its words are correctly
     // aligned. Moreover, the alignment of the 'next' and 'prev' pointers must
     // be satisfied. Thus, we use align on max(align, struct segment_node_t*).
+    // std::cerr << "CHECKPOINT" << __LINE__ << std::endl;
     size_t align = ((struct region_t*) shared)->align;
     align = align < sizeof(struct segment_node_t*) ? sizeof(void*) : align;
 
@@ -334,10 +380,12 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void **target) noe
     if (sn->next) sn->next->prev = sn;
     ((struct region_t*) shared)->allocs = sn;
 
+    // std::cerr << "CHECKPOINT" << __LINE__ << std::endl;
     void *segment = (void*) ((uintptr_t) sn + sizeof(struct segment_node_t));
     std::memset(segment, 0, size);
     *target = segment;
 
+    // std::cerr << "CHECKPOINT" << __LINE__ << std::endl;
     return Alloc::success;
 }
 
@@ -347,7 +395,14 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void **target) noe
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) noexcept {
-    // TODO: tm_free(shared_t, tx_t, void*)
-    return false;
+bool tm_free(shared_t shared, tx_t unused(tx), void* segment) noexcept {
+    struct segment_node_t* sn = (struct segment_node_t*) ((uintptr_t) segment - sizeof(segment_node_t));
+
+    // Remove from the linked list
+    if (sn->prev) sn->prev->next = sn->next;
+    else ((struct region_t*) shared)->allocs = sn->next;
+    if (sn->next) sn->next->prev = sn->prev;
+
+    free(sn);
+    return true;
 }
