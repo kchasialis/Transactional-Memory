@@ -35,7 +35,7 @@ constexpr size_t pow2(size_t pow)
 }
 
 constexpr size_t NUM_LOCKS = pow2(10);
-constexpr size_t SPINLOCK_TRIES = pow2(10);
+constexpr size_t SPINLOCK_TRIES = pow2(5);
 
 struct write_map_value_t {
     void *value;
@@ -45,6 +45,39 @@ struct write_map_value_t {
 struct lock_t {
     std::atomic<uint64_t> version_number;
     std::atomic<bool> lock;
+
+    lock_t() : version_number(0), lock(0) {}
+
+    bool acquire_lock() {
+        // Bounded spinlock.
+        size_t tries = 0;
+        while (tries < SPINLOCK_TRIES) {
+            if (!lock.exchange(true, std::memory_order_acquire)) {
+                // Lock acquired.
+                return true;
+            }
+            tries++;
+        }
+
+        // Lock not acquired.
+        return false;
+    }
+
+    void release_lock() {
+        lock.exchange(false, std::memory_order_release);
+    }
+
+    bool locked() const {
+        return lock.load();
+    }
+
+    uint64_t get_version_number() const {
+        return version_number.load();
+    }
+
+    void set_version_number(uint64_t new_version_number) {
+        return version_number.store(new_version_number);
+    }
 };
 
 struct transaction_t {
@@ -53,6 +86,7 @@ struct transaction_t {
     std::list<void *> write_set;
     std::unordered_map<key_type, value_type> write_map; // Location -> Value map.
     std::vector<const void *> read_set;  // Locations read.
+    std::vector<lock_t *> locks;  // Locks acquired.
     bool is_ro;  // Is read-only.
     uint64_t rv;  // Read version number.
 
@@ -69,6 +103,13 @@ struct transaction_t {
         // Uncommon case.
         write_set.remove(addr);
         write_set.push_back(addr);
+    }
+
+    void release_acquired_locks() {
+        for (auto& lock: locks) {
+            lock->release_lock();
+        }
+        locks.clear();
     }
 };
 
@@ -91,58 +132,12 @@ struct region_t {
     }
 
     uint64_t increment_version_clock() {
-        version_clock.fetch_add(1);
+        return version_clock.fetch_add(1) + 1;
     }
 
-    size_t get_lock_table_idx(const void *location) const {
-        std::hash<const void*> hash;
-        return hash(location) % NUM_LOCKS;
-    }
-
-    uint64_t get_version_number(const void *location) const {
-        size_t idx = get_lock_table_idx(location);
-        return lock_table[idx].version_number.load();
-    }
-
-    void set_version_number(const void *location, uint64_t version_number) {
-        size_t idx = get_lock_table_idx(location);
-        return lock_table[idx].version_number.store(version_number);
-    }
-
-    bool is_locked(const void *location) const {
-        size_t idx = get_lock_table_idx(location);
-        return lock_table[idx].lock.load();
-    }
-
-    bool acquire_lock(const void *location) {
-        size_t idx = get_lock_table_idx(location);
-        std::atomic<bool> *l = &lock_table[idx].lock;
-
-        // Bounded spinlock.
-        size_t tries = 0;
-        while (tries < SPINLOCK_TRIES) {
-            if (!l->exchange(true, std::memory_order_acquire)) {
-                // Lock acquired.
-                return true;
-            }
-            tries++;
-        }
-
-        // Lock not acquired.
-        return false;
-    }
-
-    void release_lock(const void *location) {
-        size_t idx = get_lock_table_idx(location);
-        std::atomic<bool> *l = &lock_table[idx].lock;
-        l->exchange(false, std::memory_order_release);
-    }
-
-    void release_locks(transaction_t *transaction) {
-        // Release all acquired locks and abort.
-        for (auto it = transaction->write_set.begin(); it != transaction->write_set.end(); it++) {
-            release_lock(*it);
-        }
+    lock_t *get_lock_table_entry(const void *location) {
+        // std::hash<const void*> hash;
+        return &(lock_table[(uintptr_t) location % NUM_LOCKS]);
     }
 };
 
@@ -185,14 +180,14 @@ void tm_destroy(shared_t shared) noexcept {
     // Note: To be compatible with any implementation, shared_t is defined as a
     // void*. For this particular implementation, the "real" type of a shared_t
     // is a struct region*.
-    region_t *region = (region_t *) shared;
-    while (region->allocs) { // Free allocated segments
-        segment_list tail = region->allocs->next;
-        free(region->allocs);
-        region->allocs = tail;
-    }
-    free(region->start);
-    delete region;
+    // region_t *region = (region_t *) shared;
+    // while (region->allocs) { // Free allocated segments
+    //     segment_list tail = region->allocs->next;
+    //     free(region->allocs);
+    //     region->allocs = tail;
+    // }
+    // free(region->start);
+    // delete region;
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -248,6 +243,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     transaction_t *transaction = (transaction_t *) tx;
 
     if (transaction->write_map.empty()) {
+        assert(transaction->write_set.empty());
         transaction->read_set.clear();
         return true;
     }
@@ -259,10 +255,12 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     region_t *region = ((region_t *) shared);
     // Acquire locks for write_set.
     for (auto it = transaction->write_set.cbegin(); it != transaction->write_set.cend(); it++) {
-        if (!region->acquire_lock(*it)) {
-            // region->release_locks(it);
+        lock_t *lock = region->get_lock_table_entry(*it);
+        if (lock->acquire_lock()) {
+            transaction->locks.push_back(lock);
+        } else {
             std::cerr << "Aborting transaction..." << __LINE__ << std::endl;
-            region->release_locks(transaction);
+            transaction->release_acquired_locks();
             return false;
         }
     }
@@ -273,22 +271,24 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     // Validate read set.
     if (wv != transaction->rv + 1) {
         for (const auto& addr: transaction->read_set) {
-            auto wl = region->get_version_number(addr);
-            if (wl > transaction->rv) {
+            lock_t *lock = region->get_lock_table_entry(addr);
+            auto wl = lock->get_version_number();
+            if (lock->locked() || wl > transaction->rv) {
                 std::cerr << "Aborting transaction..." << __LINE__ << std::endl;
-                region->release_locks(transaction);
+                transaction->release_acquired_locks();
                 return false;
             }
         }
     }
 
     // Commit writes and release locks.
+    std::cerr << "About to commit!!" << __LINE__ << std::endl;
     for (const auto& kv: transaction->write_map) {
         std::memcpy(kv.first, kv.second.value, kv.second.size);
-        region->release_lock(kv.first);
-        region->set_version_number(kv.first, wv);
+        lock_t *lock = region->get_lock_table_entry(kv.first);
+        lock->set_version_number(wv);
     }
-    // region->release_locks(transaction);
+    transaction->release_acquired_locks();
 
     std::cerr << "Committed transaction!" << __LINE__ << std::endl;
     return true;
@@ -305,33 +305,33 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
     auto *transaction = (transaction_t *) tx;
 
-    if (transaction->is_ro) {
-        std::memcpy(target, source, size);
-        return true;
-    }
-
-    // const_cast is undefined behavior only if we attempt to modify.
-    // This is not the case here.
-    auto it = transaction->write_map.find(const_cast<void *>(source));
-    if (it != transaction->write_map.end()) {
-        std::memcpy(target, it->second.value, it->second.size);
-        return true;
-    }
-
     region_t *region = (region_t *) shared;
-    bool locked = region->is_locked(source);
-    uint64_t version_number = region->get_version_number(source);
+    for (size_t i = 0; i < size; i += region->align) {
+        const void *src = (const char *) source + i;
+        void *dst = (char *) target + i;
+        if (!transaction->is_ro) {
+            // const_cast is undefined behavior only if we attempt to modify.
+            auto it = transaction->write_map.find(const_cast<void *>(src));
+            if (it != transaction->write_map.end()) {
+                std::memcpy(dst, it->second.value, it->second.size);
+                return true;
+            }
+        }
 
-    bool cont = !locked && version_number <= transaction->rv;
-    if (cont) {
-        std::memcpy(target, source, size);
-        transaction->read_set.push_back(source);
-        return cont;
+        lock_t *lock = region->get_lock_table_entry(src);
+        bool locked = lock->locked();
+        uint64_t version_number = lock->get_version_number();
+
+        bool stop = locked || version_number > transaction->rv;
+        if (stop) {
+            std::cerr << "Aborting transaction..." << __LINE__ << std::endl;
+            return stop;
+        }
+        std::memcpy(dst, src, region->align);
+        transaction->read_set.push_back(src);
     }
 
-    std::cerr << "Aborting transaction..." << __LINE__ << std::endl;
-    region->release_locks(transaction);
-    return cont;
+    return true;    
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -342,15 +342,20 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t unused(shared), tx_t tx, void const *source, size_t size, void *target) noexcept {
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) noexcept {
     auto *transaction = (transaction_t *) tx;
 
     assert(!transaction->is_ro);
 
-    void *temp = (void *) malloc(size);
-    std::memcpy(temp, source, size);
-    transaction->insert_write_chronological_order(target);
-    transaction->write_map[target] = {temp, size};
+    region_t *region = (region_t *) shared;
+    for (size_t i = 0; i < size; i += region->align) {
+        void *temp = (void *) malloc(region->align);
+        const void *src = (const char *) source + i;
+        void *dst = (char *) target + i;
+        std::memcpy(temp, src, region->align);
+        transaction->insert_write_chronological_order(dst);
+        transaction->write_map[dst] = {temp, region->align};
+    }
 
     return true;
 }
@@ -366,7 +371,6 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void **target) noe
     // We allocate the dynamic segment such that its words are correctly
     // aligned. Moreover, the alignment of the 'next' and 'prev' pointers must
     // be satisfied. Thus, we use align on max(align, struct segment_node_t*).
-    // std::cerr << "CHECKPOINT" << __LINE__ << std::endl;
     size_t align = ((struct region_t*) shared)->align;
     align = align < sizeof(struct segment_node_t*) ? sizeof(void*) : align;
 
@@ -380,12 +384,10 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void **target) noe
     if (sn->next) sn->next->prev = sn;
     ((struct region_t*) shared)->allocs = sn;
 
-    // std::cerr << "CHECKPOINT" << __LINE__ << std::endl;
     void *segment = (void*) ((uintptr_t) sn + sizeof(struct segment_node_t));
     std::memset(segment, 0, size);
     *target = segment;
 
-    // std::cerr << "CHECKPOINT" << __LINE__ << std::endl;
     return Alloc::success;
 }
 
