@@ -513,6 +513,7 @@ public:
     **/
     Type read(size_t index) const {
         Type res;
+        std::cerr << "CHECK" << __LINE__ << std::endl;
         tx.read(address + index, sizeof(Type), &res);
         return res;
     }
@@ -521,6 +522,7 @@ public:
      * @param source Private content to write at the shared address
     **/
     void write(size_t index, Type const& source) const {
+        std::cerr << "CHECK" << __LINE__ << std::endl;
         tx.write(tx, &source, sizeof(Type), address + index);
     }
 public:

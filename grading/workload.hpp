@@ -32,6 +32,41 @@
 
 // -------------------------------------------------------------------------- //
 
+#include <execinfo.h>  // for backtrace
+#include <dlfcn.h>     // for dladdr
+#include <cxxabi.h>    // for __cxa_demangle
+#include <string>
+#include <sstream>
+
+// std::string Backtrace(int skip = 1)
+// {
+// void *callstack[128];
+// const int nMaxFrames = sizeof(callstack) / sizeof(callstack[0]);
+// char buf[1024];
+// int nFrames = backtrace(callstack, nMaxFrames);
+// 	std::ostringstream trace_buf;
+// for (int i = skip; i < nFrames; i++) {
+// 		Dl_info info;
+// if (dladdr(callstack[i], &info)) {
+// char *demangled = NULL;
+// int status;
+// 			demangled = abi::__cxa_demangle(info.dli_sname, NULL, 0, &status);
+// snprintf(buf, sizeof(buf), "%-3d %*0p %s + %zd\n",
+// 					 i, 2 + sizeof(void*) * 2, callstack[i],
+// 					 status == 0 ? demangled : info.dli_sname,
+// 					 (char *)callstack[i] - (char *)info.dli_saddr);
+// free(demangled);
+// 		} else {
+// snprintf(buf, sizeof(buf), "%-3d %*0p\n",
+// 					 i, 2 + sizeof(void*) * 2, callstack[i]);
+// 		}
+// 		trace_buf << buf;
+// 	}
+// if (nFrames == nMaxFrames)
+// 		trace_buf << "  [truncated]\n";
+// return trace_buf.str();
+// }
+
 /** Worker unique ID type.
 **/
 using Uid = uint_fast32_t;
@@ -170,13 +205,18 @@ private:
                 sum += segment.parity; // We also sum the money that results from the destruction of accounts.
                 for (decltype(count) i = 0; i < segment_count; ++i) {
                     Balance local = segment.accounts[i];
-                    if (unlikely(local < 0)) // If one account has a negative balance, there's a consistency issue.
+                    if (unlikely(local < 0)) { // If one account has a negative balance, there's a consistency issue.
+                        std::cerr << "HERE" << __LINE__ << std::endl;
                         return false;
+                    }
                     sum += local;
                 }
                 start = segment.next; // Accounts are stored in linked segments, we move to the next one.
             }
             nbaccounts = count;
+            if (sum != static_cast<Balance>(init_balance * count)) {
+                std::cerr << "HERE " << sum << " " << static_cast<Balance>(init_balance * count) << std::endl;
+            }
             return sum == static_cast<Balance>(init_balance * count); // Consistency check: no money should ever be destroyed or created out of thin air.
         });
     }
@@ -281,6 +321,10 @@ public:
         transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
             AccountSegment segment{tx, tm.get_start()};
             segment.count = nbaccounts;
+            for (size_t i = 0; i < nbaccounts; ++i) {
+                segment.accounts[i] = init_balance;
+            }
+
             for (size_t i = 0; i < nbaccounts; ++i)
                 segment.accounts[i] = init_balance;
         });
