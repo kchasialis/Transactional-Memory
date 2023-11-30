@@ -148,8 +148,8 @@ struct region_t {
     size_t align;
     segment_list allocs;
 
-    region_t(size_t sz, size_t alg, void *st) : version_clock.store(0), size(sz), 
-        align(alg), start(s), allocs(nullptr) {
+    region_t(size_t sz, size_t alg, void *st) : version_clock(0), size(sz), 
+        align(alg), start(st), allocs(nullptr) {
 
         std::memset(start, 0, size);
         for (size_t i = 0; i < size; i += align) {

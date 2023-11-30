@@ -206,7 +206,6 @@ private:
                 for (decltype(count) i = 0; i < segment_count; ++i) {
                     Balance local = segment.accounts[i];
                     if (unlikely(local < 0)) { // If one account has a negative balance, there's a consistency issue.
-                        std::cerr << "HERE" << __LINE__ << std::endl;
                         return false;
                     }
                     sum += local;
