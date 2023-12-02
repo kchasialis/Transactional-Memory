@@ -25,28 +25,24 @@
 #include <cassert>
 #include <iostream>
 #include <set>
-#include <unordered_map>
+#include <unordered_set>
 
 // Internal headers
 #include "tm.hpp"
 #include "macros.h"
 
-// constexpr size_t pow2(size_t pow)
-// {
-//     return (pow >= sizeof(unsigned int)*8) ? 0 :
-//         pow == 0 ? 1 : 2 * pow2(pow - 1);
-// }
+constexpr size_t pow2(size_t pow)
+{
+    return (pow >= sizeof(unsigned int)*8) ? 0 :
+        pow == 0 ? 1 : 2 * pow2(pow - 1);
+}
 
-// constexpr size_t NUM_LOCKS = pow2(20);
-// constexpr size_t SPINLOCK_TRIES = 10;
-// constexpr uint64_t HASH_MASK = 0x3FFFFC; 
+constexpr size_t NUM_LOCKS = pow2(30);
+constexpr uint64_t HASH_MASK = 0x3FFFFC; 
 
 struct lock_t {
     std::atomic<uint64_t> versioned_lock;
-    // std::atomic<uint32_t> version_number;
-    // std::atomic<bool> lock;
 
-    // lock_t() : version_number(0), lock(0) {}
     lock_t() : versioned_lock(0) {}
 
     bool acquire_lock() {
@@ -56,29 +52,6 @@ struct lock_t {
         }
 
         return versioned_lock.compare_exchange_strong(vl, vl | 0x1);
-        // size_t tries = 0;
-        // while (tries < SPINLOCK_TRIES) {
-        //     if (versioned_lock.compare_exchange_strong(vl, vl | 0x1)) {
-        //         return true;
-        //     }
-        //     tries++;
-        // }
-
-        // return false;
-        // uint64_t expected = versioned_lock.load();
-        // uint64_t desired = expected | 0x1;  // Desire it to be locked.
-        // // Bounded spinlock.
-        // size_t tries = 0;
-        // while (tries < SPINLOCK_TRIES) {
-        //     if (versioned_lock.compare_exchange_strong(expected, desired)) {
-        //         // Lock acquired.
-        //         return true;
-        //     }
-        //     tries++;
-        // }
-
-        // Lock not acquired.
-        // return false;
     }
 
     uint64_t get_versioned_lock() {
@@ -126,14 +99,6 @@ struct transaction_t {
     std::vector<read_set_value_t> read_set;
     bool is_ro;  // Is read-only.
     uint64_t rv;  // Read version number.
-
-    // void release_acquired_locks() {
-    //     for (auto it = write_set.begin(); it != write_set.end(); it++) {
-    //         if (it->second.lock != nullptr) {
-    //             it->second.lock->release_lock();
-    //         }
-    //     }
-    // }
 };
 
 struct segment_node_t {
@@ -143,9 +108,9 @@ struct segment_node_t {
 typedef struct segment_node_t* segment_list;
 
 struct region_t {
+    lock_t lock_table[NUM_LOCKS];
+    std::unordered_set<struct segment_node_t*> freed;
     std::atomic<uint64_t> version_clock;
-    std::unordered_map<void *, lock_t *> lock_map;
-    // lock_t lock_table[NUM_LOCKS];
     size_t size;
     size_t align;
     void *start;
@@ -155,9 +120,6 @@ struct region_t {
         align(alg), start(st), allocs(nullptr) {
 
         std::memset(start, 0, size);
-        for (size_t i = 0; i < size; i += align) {
-            set_lock_table_entry((char *) start + i);
-        }
     }
 
     uint64_t get_version_clock() const {
@@ -172,18 +134,8 @@ struct region_t {
         start = st;
     }
 
-    void set_lock_table_entry(void *location) {
-        lock_map[location] = new lock_t;
-    }
-
     lock_t *get_lock_table_entry(void *location) {
-        //  try {
-        //     return lock_map.at(location);
-        // }
-        // catch (const std::out_of_range& oor) {
-        //     std::cerr << "Out of Range error: " << oor.what() << '\n';
-        // }
-        return lock_map[location];
+        return lock_table + ((uintptr_t) location & HASH_MASK);
     }
 };
 
@@ -305,8 +257,6 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
                 --it;
                 region->get_lock_table_entry(it->first)->release_lock();
             }
-            // std::cerr << "Aborting" << __LINE__ << std::endl;
-            // transaction->release_acquired_locks();
             return false;
         }
     }
@@ -323,31 +273,15 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
                     lock_t *lock = region->get_lock_table_entry(it->first);
                     lock->release_lock();
                 }
-
-                // transaction->release_acquired_locks();
-                // std::cerr << "Aborting" << __LINE__ << std::endl;
                 return false;
             }
-            // auto wl = v.lock->get_version_number();
-            // if (v.lock->locked() || wl > transaction->rv) {
-            //     // std::cerr << "Aborting" << __LINE__ << std::endl;
-            //     // transaction->release_acquired_locks(transaction->write_set.size());
-            //     transaction->release_acquired_locks();
-            //     return false;
-            // }
         }
     }
 
-    // Commit writes and release locks.
-    // for (const auto& v: transaction->write_set) {
-    //     std::memcpy(v.location, v.value, region->align);
-    //     v.lock->set_version_number(wv);
-    // }
     for (const auto& v: transaction->write_set) {
         std::memcpy(v.first, v.second.value, region->align);
         lock_t *lock = region->get_lock_table_entry(v.first);
         lock->set_version_number(wv);
-        // v.second.lock->set_version_number(wv);
     }
 
     return true;
@@ -452,17 +386,13 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void **target) noe
     // Insert in the linked list
     region_t *region = (struct region_t *) shared;
     sn->prev = nullptr;
-    sn->next = ((struct region_t*) shared)->allocs;
+    sn->next = region->allocs;
     if (sn->next) sn->next->prev = sn;
     region->allocs = sn;
 
     void *segment = (void*) ((uintptr_t) sn + sizeof(struct segment_node_t));
     std::memset(segment, 0, size);
     *target = segment;
-
-    for (size_t i = 0; i < size; i += region->align) {
-        region->set_lock_table_entry((char *) segment + i);
-    }
 
     return Alloc::success;
 }
@@ -474,14 +404,19 @@ Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void **target) noe
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t shared, tx_t unused(tx), void* segment) noexcept {
-    // struct segment_node_t* sn = (struct segment_node_t*) ((uintptr_t) segment - sizeof(segment_node_t));
+    struct segment_node_t* sn = (struct segment_node_t*) ((uintptr_t) segment - sizeof(segment_node_t));
 
-    // // Remove from the linked list
-    // if (sn->prev) sn->prev->next = sn->next;
-    // else ((struct region_t*) shared)->allocs = sn->next;
-    // if (sn->next) sn->next->prev = sn->prev;
+    // Remove from the linked list
+    region_t *region = (region_t *) shared;
+    if (sn->prev) sn->prev->next = sn->next;
+    else region->allocs = sn->next;
+    if (sn->next) sn->next->prev = sn->prev;
 
-    // free(sn);
+    auto it = region->freed.find(sn);
+    if (it == region->freed.end()) {
+        free(sn);
+        region->freed.insert(sn);
+    }
     
     return true;
 }
