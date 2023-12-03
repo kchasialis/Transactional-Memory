@@ -134,6 +134,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     transaction_t *transaction = (transaction_t *) tx;
 
     if (transaction->is_ro || transaction->write_set.empty()) {
+        delete transaction;
         return true;
     }
 
@@ -173,6 +174,8 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
         lock_t *lock = region->get_lock_table_entry(v.first);
         lock->set_version_number(wv);
     }
+
+    delete transaction;
 
     return true;
 }
@@ -244,7 +247,15 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         void *dst = (char *) target + i;
         void *temp = (void *) malloc(region->align);
         std::memcpy(temp, src, region->align);
-        transaction->write_set[dst] = {temp};
+        auto it = transaction->write_set.find(dst);
+        if (it != transaction->write_set.end()) {
+            // Swap and deallocate previous entry.
+            free(it->second);
+            it->second = temp;
+        } else {
+            // Else create a new one.
+            transaction->write_set[dst] = {temp};
+        }
     }
 
     return true;
