@@ -170,7 +170,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
 
     // Write to memory, update version number and release locks.
     for (const auto& v: transaction->write_set) {
-        std::memcpy(v.first, v.second, region->align);
+        std::memcpy(v.first, &v.second, region->align);
         lock_t *lock = region->get_lock_table_entry(v.first);
         lock->set_version_number(wv);
     }
@@ -210,7 +210,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         } else {
             auto it = transaction->write_set.find(const_cast<void *>(src));
             if (it != transaction->write_set.end()) {
-                std::memcpy(dst, it->second, region->align);
+                std::memcpy(dst, &(it->second), region->align);
                 continue;
             } else {
                 if (!validate_lock_version_number(lock, transaction->rv, version_number)) {
@@ -245,17 +245,19 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     for (size_t i = 0; i < size; i += region->align) {
         const void *src = (const char *) source + i;
         void *dst = (char *) target + i;
-        void *temp = (void *) malloc(region->align);
-        std::memcpy(temp, src, region->align);
-        auto it = transaction->write_set.find(dst);
-        if (it != transaction->write_set.end()) {
-            // Swap and deallocate previous entry.
-            free(it->second);
-            it->second = temp;
-        } else {
-            // Else create a new one.
-            transaction->write_set[dst] = {temp};
-        }
+        uint64_t val;
+        // void *temp = (void *) malloc(region->align);
+        std::memcpy(&val, src, region->align);
+        transaction->write_set[dst] = val;
+        // auto it = transaction->write_set.find(dst);
+        // if (it != transaction->write_set.end()) {
+        //     // Swap and deallocate previous entry.
+        //     free(it->second);
+        //     it->second = temp;
+        // } else {
+        //     // Else create a new one.
+        //     transaction->write_set[dst] = {temp};
+        // }
     }
 
     return true;

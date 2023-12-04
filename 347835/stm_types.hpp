@@ -72,18 +72,18 @@ struct read_set_value_t {
 };
 
 struct transaction_t {
-    using write_map_value_t = void *;
+    using write_map_value_t = uint64_t;
     std::map<void *, write_map_value_t> write_set; // Write set, ordered by smaller memory locations.
     std::vector<read_set_value_t> read_set;
     bool is_ro;
     uint64_t rv;  // Read version number.
 
-    ~transaction_t() {
-        // Free malloc'd values in the write_set.
-        for (const auto& v: write_set) {
-            free(v.second);
-        }
-    }
+    // ~transaction_t() {
+    //     // Free malloc'd values in the write_set.
+    //     for (const auto& v: write_set) {
+    //         free(v.second);
+    //     }
+    // }
 };
 
 struct segment_node_t {
