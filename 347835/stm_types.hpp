@@ -60,7 +60,7 @@ constexpr size_t pow2(size_t pow)
         pow == 0 ? 1 : 2 * pow2(pow - 1);
 }
 
-constexpr size_t NUM_LOCKS = pow2(22);
+constexpr size_t NUM_LOCKS = pow2(25);
 
 struct read_set_value_t {
     const void *location;
@@ -73,17 +73,11 @@ struct read_set_value_t {
 
 struct transaction_t {
     using write_map_value_t = uint64_t;
-    std::map<void *, write_map_value_t> write_set; // Write set, ordered by smaller memory locations.
+    // Write map (location -> value), ordered by smaller memory locations.
+    std::map<void *, write_map_value_t> write_set;
     std::vector<read_set_value_t> read_set;
     bool is_ro;
     uint64_t rv;  // Read version number.
-
-    // ~transaction_t() {
-    //     // Free malloc'd values in the write_set.
-    //     for (const auto& v: write_set) {
-    //         free(v.second);
-    //     }
-    // }
 };
 
 struct segment_node_t {

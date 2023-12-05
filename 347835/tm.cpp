@@ -246,18 +246,8 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         const void *src = (const char *) source + i;
         void *dst = (char *) target + i;
         uint64_t val;
-        // void *temp = (void *) malloc(region->align);
         std::memcpy(&val, src, region->align);
         transaction->write_set[dst] = val;
-        // auto it = transaction->write_set.find(dst);
-        // if (it != transaction->write_set.end()) {
-        //     // Swap and deallocate previous entry.
-        //     free(it->second);
-        //     it->second = temp;
-        // } else {
-        //     // Else create a new one.
-        //     transaction->write_set[dst] = {temp};
-        // }
     }
 
     return true;
