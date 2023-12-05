@@ -60,7 +60,7 @@ constexpr size_t pow2(size_t pow)
         pow == 0 ? 1 : 2 * pow2(pow - 1);
 }
 
-constexpr size_t NUM_LOCKS = pow2(25);
+constexpr size_t NUM_LOCKS = pow2(20);
 
 struct read_set_value_t {
     const void *location;
