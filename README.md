@@ -17,6 +17,5 @@ This repository provides:
 * examples of how to use synchronization primitives (in `sync-examples/`)
 * implementation (in `src`)
 * implementation testing (in `benchmarks/`)
-* (https://dcl.epfl.ch/site/_media/education/ca-project.pdf))
 
 * The implementation is based on on [TL2](https://dcl.epfl.ch/site/_media/education/4.pdf) algorithm
